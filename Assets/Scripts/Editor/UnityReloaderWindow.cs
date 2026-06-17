@@ -397,7 +397,7 @@ namespace UnityReloader.Editor
 
             DrawToggleField(
                 "Editor Hot-Reload",
-                "Also hot-reload outside Play Mode. With Unity auto-refresh off, this applies edit-mode changes instantly instead of waiting for a manual recompile.",
+                "Reload outside Play Mode. With Unity auto-refresh off, this applies edit-mode changes instantly instead of waiting for a manual recompile.",
                 UnityReloaderPreference.EnableExperimentalEditorHotReloadSupport);
 
             DrawToggleField(
