@@ -28,11 +28,10 @@ namespace UnityReloader.Runtime
         static void Init()
         {
 #if UNITY_EDITOR
-            LastDetourFilePath = Path.GetTempPath() + Application.productName + "-last-detour.txt";
-            foreach (var c in Path.GetInvalidFileNameChars()) 
-            { 
-                LastDetourFilePath = LastDetourFilePath.Replace(c, '-'); 
-            }
+            var safeName = Application.productName;
+            foreach (var c in Path.GetInvalidFileNameChars())
+                safeName = safeName.Replace(c, '-');
+            LastDetourFilePath = Path.Combine(Path.GetTempPath(), safeName + "-last-detour.txt");
 #else
             LoggerScoped.Log($"{nameof(DetourCrashHandler)}: currently only supported in Editor");
 #endif

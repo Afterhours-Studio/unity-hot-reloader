@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -28,9 +29,10 @@ namespace UnityReloader.Editor.Compilation
 
         private static string ApplicationContentsPath = EditorApplication.applicationContentsPath;
         private static readonly List<string> _createdFilesToCleanUp = new List<string>();
-        private static readonly Dictionary<string, Assembly> _typeNameAssemblyCache = new Dictionary<string, Assembly>(16);
+        private static readonly object _cleanupLock = new object();
+        private static readonly ConcurrentDictionary<string, Assembly> _typeNameAssemblyCache = new ConcurrentDictionary<string, Assembly>(16, 16);
         private static readonly List<string> _analyzers = new List<string>();
-        private static readonly Dictionary<string, List<Assembly>> _assemblyNameToFriendAssemblyCache = new Dictionary<string, List<Assembly>>(16);
+        private static readonly ConcurrentDictionary<string, List<Assembly>> _assemblyNameToFriendAssemblyCache = new ConcurrentDictionary<string, List<Assembly>>(16, 16);
 
         static DotnetExeDynamicCompilation()
         {
@@ -60,10 +62,11 @@ namespace UnityReloader.Editor.Compilation
 
             EditorApplication.playModeStateChanged += obj =>
             {
-                if (obj == PlayModeStateChange.ExitingPlayMode && _createdFilesToCleanUp.Any())
+                if (obj != PlayModeStateChange.ExitingPlayMode) return;
+                lock (_cleanupLock)
                 {
+                    if (_createdFilesToCleanUp.Count == 0) return;
                     LoggerScoped.LogDebug($"Removing temporary files: [{string.Join(",", _createdFilesToCleanUp)}]");
-
                     foreach (var fileToCleanup in _createdFilesToCleanUp)
                     {
                         new FileInfo(fileToCleanup).IsReadOnly = false;
@@ -137,8 +140,10 @@ namespace UnityReloader.Editor.Compilation
             }
             catch (Exception e)
             {
+                string[] cleanupSnapshot;
+                lock (_cleanupLock) { cleanupSnapshot = _createdFilesToCleanUp.ToArray(); }
                 LoggerScoped.LogError($"Compilation error: temporary files were not removed so they can be inspected: "
-                               + string.Join(", ", _createdFilesToCleanUp
+                               + string.Join(", ", cleanupSnapshot
                                    .Select(f => $"<a href=\"{f}\" line=\"1\">{f}</a>")));
                 if (LogHowToFixMessageOnCompilationError)
                 {
@@ -210,7 +215,8 @@ You can also:
         {
             File.WriteAllText(filePath, contents);
             new FileInfo(filePath).IsReadOnly = true;
-            createdFilesToCleanUp.Add(filePath);
+            lock (_cleanupLock)
+                createdFilesToCleanUp.Add(filePath);
         }
 
         private static Assembly GetAssemblyByTypeName(string typeName)
@@ -225,42 +231,35 @@ You can also:
             // It's much faster.
             assembly = AppDomain.CurrentDomain.GetAssemblies().SingleOrDefault(asm => asm.GetType(typeName, false) != null);
 
-            if (assembly != null) _typeNameAssemblyCache.Add(typeName, assembly);
+            if (assembly != null) _typeNameAssemblyCache.TryAdd(typeName, assembly);
             return assembly;
         }
 
         private static List<Assembly> GetFriendAssembliesByAssemblyName(string assemblyName)
         {
+            return _assemblyNameToFriendAssemblyCache.GetOrAdd(assemblyName, BuildFriendAssemblyList);
+        }
+
+        private static List<Assembly> BuildFriendAssemblyList(string assemblyName)
+        {
             const string AssemblyNamePublicKeySeparator = ", ";
-
-            // Assert: assemblyName is in short pattern
-
-            if (!_assemblyNameToFriendAssemblyCache.TryGetValue(assemblyName, out var assemblies))
+            var assemblies = new List<Assembly>();
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
-                _assemblyNameToFriendAssemblyCache[assemblyName] = assemblies = new();
-                foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+                if (assembly.IsDynamic) continue;
+                if (assembly.GetCustomAttribute<DynamicallyCreatedAssemblyAttribute>() != null) continue;
+
+                foreach (var attr in assembly.GetCustomAttributes<InternalsVisibleToAttribute>())
                 {
-                    if (assembly.IsDynamic) continue;
+                    var friendAssemblyName = attr.AssemblyName;
+                    var separatorIndex = friendAssemblyName.IndexOf(AssemblyNamePublicKeySeparator);
+                    if (separatorIndex != ~0)
+                        friendAssemblyName = friendAssemblyName[..separatorIndex];
 
-                    if (assembly.GetCustomAttribute<DynamicallyCreatedAssemblyAttribute>() != null) continue;
-
-                    foreach (var attr in assembly.GetCustomAttributes<InternalsVisibleToAttribute>())
-                    {
-                        var friendAssemblyName = attr.AssemblyName;
-                        var separatorIndex = friendAssemblyName.IndexOf(AssemblyNamePublicKeySeparator);
-                        if (separatorIndex != ~0)
-                        {
-                            friendAssemblyName = friendAssemblyName[..separatorIndex];
-                        }
-
-                        if (friendAssemblyName == assemblyName)
-                        {
-                            assemblies.Add(assembly);
-                        }
-                    }
+                    if (friendAssemblyName == assemblyName)
+                        assemblies.Add(assembly);
                 }
             }
-
             return assemblies;
         }
 

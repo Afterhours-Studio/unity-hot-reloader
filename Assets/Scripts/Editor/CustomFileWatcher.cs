@@ -36,6 +36,7 @@ public class CustomFileWatcher : EditorWindow
 
     private static object ListLock; // Shared lock object
     private static Thread LivewatcherThread;
+    private static Timer _livewatcherTimer;
 
     public static bool InitSignaled = false;
     private static readonly int WatcherThreadRunEveryNSeconds = 500; //TODO: expose in settings
@@ -70,12 +71,10 @@ public class CustomFileWatcher : EditorWindow
             return;
         }
 
-        // Run on a separate thread every 1 second
-        LivewatcherThread = new Thread(() =>
+            LivewatcherThread = new Thread(() =>
         {
-            var timer = new Timer((state) =>
+            _livewatcherTimer = new Timer((state) =>
             {
-                // Go at it if we've initialized
                 if (FileHashes.Count > 0)
                     UpdateFileWatcher();
             }, null, 0, WatcherThreadRunEveryNSeconds);

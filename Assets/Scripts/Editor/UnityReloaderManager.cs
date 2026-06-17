@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -65,10 +66,12 @@ namespace UnityReloader.Editor
 #pragma warning restore 0618
 
         private List<DynamicFileHotReloadState> _dynamicFileHotReloadStateEntries = new List<DynamicFileHotReloadState>();
+        // Paths enqueued by background watcher threads; drained on the main thread each Update tick.
+        private readonly ConcurrentQueue<string> _pendingFileChangePaths = new ConcurrentQueue<string>();
 
         private DateTime _lastTimeChangeBatchRun = default(DateTime);
         private bool _assemblyChangesLoaderResolverResolutionAlreadyCalled;
-        private bool _isEditorModeHotReloadEnabled;
+        private volatile bool _isEditorModeHotReloadEnabled;
 
         // Set on the background compile thread when a hot-reload fails; consumed on the
         // main thread in Update to trigger a full Unity recompile fallback (needed because
@@ -98,27 +101,43 @@ namespace UnityReloader.Editor
                 LoggerScoped.LogWarning($"Specified file: '{filePath}' does not exist. Hot-Reload will not be performed.");
                 return;
             }
-            
-            if (_currentFileExclusions != null && _currentFileExclusions.Any(fp => filePath.Replace("\\", "/").EndsWith(fp)))
-            {
-                LoggerScoped.LogWarning($"UnityReloader: File: '{filePath}' changed, but marked as exclusion. Hot-Reload will not be performed. You can manage exclusions via" +
-                                        $"\r\nRight click context menu (Unity Reloader > Add / Remove Hot-Reload exclusion)" +
-                                        $"\r\nor via Tools -> Unity Reloader -> Start Screen -> Exclusion menu");
-            
-                return;
-            }
-            
+
+            // Fast-path: skip obviously ignorable changes before touching the queue.
+            // ShouldIgnoreFileChange reads volatile/_lastPlayModeStateChange which is benign
+            // from a background thread (worst case: one extra enqueue that gets filtered on drain).
+            if (ShouldIgnoreFileChange()) return;
+
+            _pendingFileChangePaths.Enqueue(filePath);
+        }
+
+        // Called on main thread each Update tick. Applies exclusion, debounce, and ignore checks
+        // before committing to _dynamicFileHotReloadStateEntries (which is main-thread-only).
+        private void DrainPendingFileChanges()
+        {
             const int msThresholdToConsiderSameChangeFromDifferentFileWatchers = 500;
-            var isDuplicatedChangesComingFromDifferentFileWatcher = _dynamicFileHotReloadStateEntries
-                .Any(f => f.FullFileName == filePath
-                          && (DateTime.UtcNow - f.FileChangedOn).TotalMilliseconds < msThresholdToConsiderSameChangeFromDifferentFileWatchers);
-            if (isDuplicatedChangesComingFromDifferentFileWatcher)
+            while (_pendingFileChangePaths.TryDequeue(out var filePath))
             {
-                LoggerScoped.LogWarning($"UnityReloader: Looks like change to: {filePath} have already been added for processing. This can happen if you have multiple file watchers set in a way that they overlap.");
-                return;
+                if (ShouldIgnoreFileChange()) continue;
+
+                if (_currentFileExclusions != null && _currentFileExclusions.Any(fp => filePath.Replace("\\", "/").EndsWith(fp)))
+                {
+                    LoggerScoped.LogWarning($"UnityReloader: File: '{filePath}' changed, but marked as exclusion. Hot-Reload will not be performed. You can manage exclusions via" +
+                                            $"\r\nRight click context menu (Unity Reloader > Add / Remove Hot-Reload exclusion)" +
+                                            $"\r\nor via Tools -> Unity Reloader -> Start Screen -> Exclusion menu");
+                    continue;
+                }
+
+                var isDuplicate = _dynamicFileHotReloadStateEntries
+                    .Any(f => f.FullFileName == filePath
+                              && (DateTime.UtcNow - f.FileChangedOn).TotalMilliseconds < msThresholdToConsiderSameChangeFromDifferentFileWatchers);
+                if (isDuplicate)
+                {
+                    LoggerScoped.LogWarning($"UnityReloader: Looks like change to: {filePath} have already been added for processing. This can happen if you have multiple file watchers set in a way that they overlap.");
+                    continue;
+                }
+
+                _dynamicFileHotReloadStateEntries.Add(new DynamicFileHotReloadState(filePath, DateTime.UtcNow));
             }
-            
-            _dynamicFileHotReloadStateEntries.Add(new DynamicFileHotReloadState(filePath, DateTime.UtcNow));
         }
 
         public bool ShouldIgnoreFileChange()
@@ -535,6 +554,7 @@ namespace UnityReloader.Editor
             }
             
             AssignConfigValuesThatCanNotBeAccessedOutsideOfMainThread();
+            DrainPendingFileChanges();
 
             if (!_assemblyChangesLoaderResolverResolutionAlreadyCalled)
             {
@@ -804,7 +824,7 @@ Workaround will search in all folders (under project root) and will use first fo
                 if (Instance._fileWatchers.Count == 0 || UnityReloaderPreference.FileWatcherSetupEntriesChanged)
                 {
                     UnityReloaderPreference.FileWatcherSetupEntriesChanged = false;
-
+                    ClearFileWatchers();
                     InitializeFromFileWatcherSetupEntries();
                 }
             }

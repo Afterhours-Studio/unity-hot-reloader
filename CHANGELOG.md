@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.0] - 2026-06-17
+
+### Fixed
+- Race condition on file change processing. Background watcher threads (FileSystemWatcher, custom polling timer) previously wrote directly to `_dynamicFileHotReloadStateEntries` (a non-thread-safe `List<T>`), which could cause `InvalidOperationException` or corrupt state under concurrent access. Watchers now enqueue paths to a `ConcurrentQueue<string>` and the main thread drains it each `Update` tick, applying debounce and exclusion checks before committing entries to the processing list.
+- `_isEditorModeHotReloadEnabled` marked `volatile` to ensure background threads see fresh values when doing fast-path ignore checks.
+- Crash log path corruption on Windows: `DetourCrashHandler` was applying `Path.GetInvalidFileNameChars()` (which includes `:` and `\`) to the full path string, corrupting the drive letter and directory separators. Fix: sanitize only `Application.productName`, then compose the path with `Path.Combine`.
+- `CustomFileWatcher` polling timer was eligible for GC collection after the thread that created it exited. The `Timer` is now held in a `static` field, keeping it alive for the session.
+- `DotnetExeCompilator` static caches (`_typeNameAssemblyCache`, `_assemblyNameToFriendAssemblyCache`) switched to `ConcurrentDictionary` and friend-assembly list is built before being stored, preventing a partial-population race when two compiles run concurrently. Cleanup list (`_createdFilesToCleanUp`) access locked with a dedicated lock object.
+
 ## [1.0.4] - 2026-06-17
 
 ### Fixed
