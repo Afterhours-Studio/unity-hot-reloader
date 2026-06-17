@@ -151,7 +151,20 @@ namespace UnityReloader.Runtime
                     }
                     else
                     {
-                        LoggerScoped.LogWarning($"FSR: Unable to find existing type for: '{createdType.FullName}', this is not an issue if you added new type. <color=orange>If it's an existing type please do a full domain-reload - one of optimisations is to cache existing types for later lookup on first call.</color>");
+                        // Compiler-generated closures/iterators/async state machines (e.g. '<>c',
+                        // '<>c__DisplayClass', '<Method>d__1') have no stable name to match an existing type and are
+                        // applied through their containing type's detoured methods - so they are expected here and
+                        // would only spam the console. Only warn for genuine user types.
+                        var isCompilerGenerated = createdType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false)
+                            || createdType.Name.Contains("<");
+                        if (isCompilerGenerated)
+                        {
+                            LoggerScoped.LogDebug($"No existing match for compiler-generated type '{createdType.FullName}' - applied via its containing type.");
+                        }
+                        else
+                        {
+                            LoggerScoped.LogWarning($"FSR: Unable to find existing type for: '{createdType.FullName}', this is not an issue if you added new type. <color=orange>If it's an existing type please do a full domain-reload - one of optimisations is to cache existing types for later lookup on first call.</color>");
+                        }
                         FindAndExecuteStaticOnScriptHotReloadNoInstance(createdType);
                         FindAndExecuteOnScriptHotReload(createdType, createdType);
                     }

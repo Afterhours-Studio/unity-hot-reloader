@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.4] - 2026-06-17
+
+### Fixed
+- Stopped console spam for compiler-generated types (lambda closures `<>c`, display classes, async/iterator state machines). These have no stable name to match an existing type and are applied through their containing type, so they no longer log a warning.
+- The `InternalsVisibleTo` assembly rewrite now supplies Cecil a resolver seeded with every loaded assembly's directory. This fixes `AssemblyResolutionException` when a project references a third-party SDK (e.g. one with no metadata version) that Cecil's default resolver could not locate.
+
+### Known issues
+- Burst may log `Failed to find entry-points ... BadImageFormatException: Read out of bounds` while hashing `0Harmony.dll`. This is a bug in Burst's bundled metadata reader (present through Burst 1.8.24) parsing Harmony's assembly, not a fault in this tool - hot reload works regardless. Swapping the Harmony DLL does not help (all target-framework builds of a given Harmony version share the same metadata).
+
 ## [1.0.3] - 2026-06-17
 
 ### Changed

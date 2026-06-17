@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using UnityEditor;
@@ -17,6 +18,7 @@ namespace UnityReloader.Editor.AssemblyPostProcess
         private static readonly Type ReaderParametersType;
         private static readonly Type CustomAttributeType;
         private static readonly Type CustomAttributeArgumentType;
+        private static readonly Type DefaultAssemblyResolverType;
 
         static AddInternalsVisibleToForAllUserAssembliesPostProcess()
         {
@@ -27,6 +29,47 @@ namespace UnityReloader.Editor.AssemblyPostProcess
             ReaderParametersType = CecilAssembly.GetType("Mono.Cecil.ReaderParameters");
             CustomAttributeType = CecilAssembly.GetType("Mono.Cecil.CustomAttribute");
             CustomAttributeArgumentType = CecilAssembly.GetType("Mono.Cecil.CustomAttributeArgument");
+            DefaultAssemblyResolverType = CecilAssembly.GetType("Mono.Cecil.DefaultAssemblyResolver");
+        }
+
+        // Builds a Cecil resolver that can find every assembly referenced by the recompiled code. Without it, writing
+        // the assembly fails (AssemblyResolutionException) when a referenced assembly - e.g. a third-party SDK with no
+        // metadata version - lives outside Cecil's default search path.
+        private static object CreateAssemblyResolverWithProjectSearchDirectories()
+        {
+            var resolver = Activator.CreateInstance(DefaultAssemblyResolverType);
+            var addSearchDirectory = DefaultAssemblyResolverType.GetMethod("AddSearchDirectory", new[] { typeof(string) });
+
+            foreach (var directory in GetLoadedAssemblyDirectories())
+                addSearchDirectory.Invoke(resolver, new object[] { directory });
+
+            return resolver;
+        }
+
+        private static IEnumerable<string> GetLoadedAssemblyDirectories()
+        {
+            var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                string location;
+                try
+                {
+                    location = assembly.Location;
+                }
+                catch
+                {
+                    continue; //dynamic assemblies throw on Location - skip
+                }
+
+                if (string.IsNullOrEmpty(location))
+                    continue;
+
+                var directory = Path.GetDirectoryName(location);
+                if (!string.IsNullOrEmpty(directory))
+                    directories.Add(directory);
+            }
+
+            return directories;
         }
 
         public static string CreateAssemblyWithInternalsContentsVisibleTo(Assembly changedAssembly, string visibleToAssemblyName)
@@ -34,9 +77,11 @@ namespace UnityReloader.Editor.AssemblyPostProcess
             if (!AdjustedAssemblyRoot.Exists)
                 AdjustedAssemblyRoot.Create();
 
-            // var readerParams = new ReaderParameters { ReadWrite = false };
+            // var readerParams = new ReaderParameters { ReadWrite = false, AssemblyResolver = resolver };
             var readerParams = Activator.CreateInstance(ReaderParametersType);
             ReaderParametersType.GetProperty("ReadWrite").SetValue(readerParams, false);
+            var assemblyResolver = CreateAssemblyResolverWithProjectSearchDirectories();
+            ReaderParametersType.GetProperty("AssemblyResolver").SetValue(readerParams, assemblyResolver);
 
             // var assembly = AssemblyDefinition.ReadAssembly(path, readerParams);
             var readAssemblyMethod = AssemblyDefinitionType.GetMethod("ReadAssembly", new[] { typeof(string), ReaderParametersType });
@@ -81,9 +126,11 @@ namespace UnityReloader.Editor.AssemblyPostProcess
             }
             finally
             {
-                // AssemblyDefinition is IDisposable
+                // AssemblyDefinition and the resolver are IDisposable
                 if (assemblyDef is IDisposable disposable)
                     disposable.Dispose();
+                if (assemblyResolver is IDisposable disposableResolver)
+                    disposableResolver.Dispose();
             }
         }
     }
