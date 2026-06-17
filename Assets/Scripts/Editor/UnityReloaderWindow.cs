@@ -273,7 +273,7 @@ namespace UnityReloader.Editor
             }
 
             UnityEngine.GUI.Label(rect, "Unity Reloader", s_HeaderTitle);
-            UnityEngine.GUI.Label(rect, "v1.0.1", s_VersionBadge);
+            UnityEngine.GUI.Label(rect, "v1.0.2", s_VersionBadge);
 
             if (Event.current.type == EventType.Repaint)
                 EditorGUI.DrawRect(new Rect(rect.x, rect.yMax - 1, rect.width, 1), Accent);
@@ -771,7 +771,7 @@ namespace UnityReloader.Editor
             GUILayout.Label("Hot Reload implementation for Unity.", EditorStyles.label);
             GUILayout.Space(8);
 
-            DrawKV("Version", "1.0.1");
+            DrawKV("Version", "1.0.2");
             DrawKV("Unity", "2022.3+");
             DrawKV("Author", "h1dr0n");
             DrawKV("License", "MIT");

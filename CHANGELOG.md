@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2] - 2026-06-17
+
+### Added
+- Hot reload for newly added methods. Private methods are applied instantly via detour (they are only reachable from their declaring type). Public/protected/internal methods auto-trigger a full recompile so they become available to scripts that were not recompiled.
+
+### Changed
+- Replaced the blanket "adding new methods is not supported" warning with accurate per-method handling and messaging.
+
 ## [1.0.1] - 2026-06-17
 
 ### Added

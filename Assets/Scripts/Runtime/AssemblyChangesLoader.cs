@@ -49,8 +49,9 @@ namespace UnityReloader.Runtime
 
         private Dictionary<Type, Type> _existingTypeToRedirectedType = new Dictionary<Type, Type>();
 
-        // True when the last update contained a structural change (fields/serialization/attributes) that
-        // method detour cannot apply. The editor reads this to fall back to a full Unity recompile.
+        // True when the last update contained a change that method detour cannot fully apply - a structural change
+        // (fields/serialization/attributes) or a new externally-callable method. The editor reads this to fall back
+        // to a full Unity recompile.
         public bool LastUpdateHadStructuralChange { get; private set; }
 
         public void DynamicallyUpdateMethodsForCreatedAssembly(Assembly dynamicallyLoadedAssemblyWithUpdates, AssemblyChangesLoaderEditorOptionsNeededInBuild editorOptions)
@@ -125,12 +126,23 @@ namespace UnityReloader.Runtime
                                     }
                                 }
                             }
-                            else 
+                            else
                             {
-                                LoggerScoped.LogWarning($"Method: {createdTypeMethodToUpdate.FullDescription()} does not exist in initially compiled type: {matchingTypeInExistingAssemblies.FullName}. " +
-                                                 $"Adding new methods at runtime is not fully supported. \r\n" +
-                                                 $"It'll only work new method is only used by declaring class (eg private method)\r\n" +
-                                                 $"Make sure to add method before initial compilation.");
+                                // A new method was added. A private method is only reachable from its declaring type,
+                                // whose already-detoured bodies in this same recompile resolve it directly - so the
+                                // change is applied by hot reload with no recompile.
+                                // Anything callable from another type (public/protected/internal) may be invoked from
+                                // scripts that were NOT recompiled and whose IL has no reference to it - so a full
+                                // recompile is required to make it available everywhere.
+                                if (createdTypeMethodToUpdate.IsPrivate)
+                                {
+                                    LoggerScoped.LogDebug($"New private method '{createdTypeMethodToUpdate.Name}' in '{matchingTypeInExistingAssemblies.Name}' hot-reloaded (usable within its declaring type).");
+                                }
+                                else
+                                {
+                                    LastUpdateHadStructuralChange = true;
+                                    LoggerScoped.Log($"New externally-callable method '{createdTypeMethodToUpdate.Name}' detected in '{matchingTypeInExistingAssemblies.Name}' - triggering a full recompile so it's available to all scripts.");
+                                }
                             }
                         }
                         
