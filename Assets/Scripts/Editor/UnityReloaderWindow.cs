@@ -273,7 +273,7 @@ namespace UnityReloader.Editor
             }
 
             UnityEngine.GUI.Label(rect, "Unity Reloader", s_HeaderTitle);
-            UnityEngine.GUI.Label(rect, "v1.0.2", s_VersionBadge);
+            UnityEngine.GUI.Label(rect, "v1.0.3", s_VersionBadge);
 
             if (Event.current.type == EventType.Repaint)
                 EditorGUI.DrawRect(new Rect(rect.x, rect.yMax - 1, rect.width, 1), Accent);
@@ -396,6 +396,11 @@ namespace UnityReloader.Editor
                 disabled: watchOnlySpecified);
 
             DrawToggleField(
+                "Editor Hot-Reload",
+                "Also hot-reload outside Play Mode. With Unity auto-refresh off, this applies edit-mode changes instantly instead of waiting for a manual recompile.",
+                UnityReloaderPreference.EnableExperimentalEditorHotReloadSupport);
+
+            DrawToggleField(
                 "Watch Only Specified",
                 "Watch files/folders you pick manually instead of the whole project.",
                 UnityReloaderPreference.WatchOnlySpecified);
@@ -489,10 +494,6 @@ namespace UnityReloader.Editor
                 "Runtime Added Fields",
                 "Render newly added fields in the Editor. Minor overhead from dynamic dictionary lookups.",
                 UnityReloaderPreference.EnableExperimentalAddedFieldsSupport, warn: true);
-            DrawToggleField(
-                "Editor Hot-Reload",
-                "Hot-reload outside Play Mode for editor scripts. Not a replacement for Unity compile/reload.",
-                UnityReloaderPreference.EnableExperimentalEditorHotReloadSupport, warn: true);
             DrawToggleField(
                 "Partial Class Support",
                 "Support partial class definitions. Can be file-read heavy.",
@@ -771,7 +772,7 @@ namespace UnityReloader.Editor
             GUILayout.Label("Hot Reload implementation for Unity.", EditorStyles.label);
             GUILayout.Space(8);
 
-            DrawKV("Version", "1.0.2");
+            DrawKV("Version", "1.0.3");
             DrawKV("Unity", "2022.3+");
             DrawKV("Author", "h1dr0n");
             DrawKV("License", "MIT");

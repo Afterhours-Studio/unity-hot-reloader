@@ -1,6 +1,6 @@
 {
     "name": "com.h1dr0n.unity-reloader",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "displayName": "Unity Reloader",
     "description": "Hot Reload implementation for Unity. Iterate on code insanely fast without breaking play session. Supports any editor. 1. Play 2. Make change 3. See results",
     "unity": "2022.3",

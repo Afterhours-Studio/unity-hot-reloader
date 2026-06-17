@@ -27,7 +27,7 @@ namespace UnityReloader.Editor
             //WARN: the URL can sometimes be adjusted, make sure updated correctly
             return $"{BaseUrl}/updates/fast-script-reload/{userId}?CurrentVersion={versionId}";
         }
-        public static string VersionId = "1.0.2";
+        public static string VersionId = "1.0.3";
         private static readonly string ProjectIconName = "ProductIcon64";
         public static readonly string ProjectName = "fast-script-reload";
 
@@ -500,13 +500,9 @@ New fields will also show in editor - you can tweak them as normal variables.", 
                     })),
                     (EditorHotReloadSection = new ChangeMainViewButton("Editor Hot-Reload", (screen) =>
                     {
-                        EditorGUILayout.HelpBox(@"Currently asset hot-reloads only in play-mode, you can enable experimental editor mode support here.
+                        EditorGUILayout.HelpBox(@"By default scripts hot-reload only in play-mode. Enable editor-mode hot reload here to apply changes without entering play mode.
 
-Please make sure to read limitation section as not all changes can be performed", MessageType.Warning);
-                        
-                        EditorGUILayout.HelpBox(@"As an experimental feature it may be unstable and is not as reliable as play-mode workflow.
-
-In some cases it can lock/crash editor.", MessageType.Error);
+Please make sure to read the limitations section as not all changes can be performed", MessageType.Info);
                         GUILayout.Space(10);
                         
                         using (LayoutHelper.LabelWidth(320))
@@ -516,9 +512,9 @@ In some cases it can lock/crash editor.", MessageType.Error);
                             var valueAfter = (bool)UnityReloaderPreference.EnableExperimentalEditorHotReloadSupport.GetEditorPersistedValueOrDefault();
                             if (!valueBefore && valueAfter)
                             {
-                                EditorUtility.DisplayDialog("Experimental feature",
-                                    "Reloading outside of playmode is still in experimental phase. " +
-                                    "\r\n\r\nIt's not as good as in-playmode workflow",
+                                EditorUtility.DisplayDialog("Editor-mode Hot-Reload enabled",
+                                    "Scripts will now hot-reload outside of play mode. " +
+                                    "\r\n\r\nNot all changes can be applied this way - see the limitations section.",
                                     "Ok");
                                 
 #if UNITY_2019_3_OR_NEWER
@@ -801,7 +797,7 @@ CustomPolling - (experimental) watches files by manual polling for changes, slow
             });
         
         public static readonly ToggleProjectEditorPreferenceDefinition EnableExperimentalEditorHotReloadSupport = new ToggleProjectEditorPreferenceDefinition(
-            "(Experimental) Enable Hot-Reload outside of play mode", "EnableExperimentalEditorHotReloadSupport", true);
+            "Enable Hot-Reload outside of play mode", "EnableExperimentalEditorHotReloadSupport", true);
         
         [Obsolete("Use EnableExperimentalEditorHotReloadSupport instead")]
         public static readonly ToggleProjectEditorPreferenceDefinition EnableCustomFileWatcher = new ToggleProjectEditorPreferenceDefinition(

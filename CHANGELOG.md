@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.3] - 2026-06-17
+
+### Changed
+- Promoted editor-mode hot reload out of "experimental". The toggle now lives in the main Hot Reload settings (renamed "Editor Hot-Reload") instead of the Experimental section, and its warning copy has been replaced with informational guidance. Behaviour and the persisted preference key are unchanged (still on by default).
+
 ## [1.0.2] - 2026-06-17
 
 ### Added
