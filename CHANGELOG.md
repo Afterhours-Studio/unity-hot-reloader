@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1] - 2026-06-17
+
+### Added
+- Hot reload for methods on generic classes. Constructed instantiations (e.g. `Container<int>`) reachable through base types, interfaces, or fields are discovered and detoured individually, covering both reference-type and value-type instantiations.
+
+### Changed
+- Generic methods (e.g. `void Foo<T>()`) no longer fail silently - they now log a precise message explaining a full recompile is required, since their runtime instantiations cannot be discovered via reflection.
+
 ## [1.0.0] - 2026-06-17
 
 ### Added

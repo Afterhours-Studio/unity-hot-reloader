@@ -94,6 +94,13 @@ namespace UnityReloader.Runtime
                         var allDeclaredMethodsInExistingType = matchingTypeInExistingAssemblies.GetMethods(ALL_DECLARED_METHODS_BINDING_FLAGS)
                             .Where(m => !ExcludeMethodsDefinedOnTypes.Contains(m.DeclaringType))
                             .ToList();
+
+                        // For a generic type the declared methods are open (Foo<T>); they can only be detoured once
+                        // bound to concrete type arguments. Discover the constructed instantiations once per type.
+                        var existingClosedTypesForGenericDeclaringType = matchingTypeInExistingAssemblies.IsGenericTypeDefinition
+                            ? FindConstructedInstantiations(matchingTypeInExistingAssemblies)
+                            : null;
+
                         foreach (var createdTypeMethodToUpdate in createdType.GetMethods(ALL_DECLARED_METHODS_BINDING_FLAGS)
                                      .Where(m => !ExcludeMethodsDefinedOnTypes.Contains(m.DeclaringType)))
                         {
@@ -102,21 +109,21 @@ namespace UnityReloader.Runtime
                                 .SingleOrDefault(m => m.FullDescription() == createdTypeMethodToUpdateFullDescriptionWithoutPatchedClassPostfix);
                             if (matchingMethodInExistingType != null)
                             {
-                                if (matchingMethodInExistingType.IsGenericMethod)
+                                foreach (var detourPair in ResolveConcreteDetourPairs(
+                                             matchingMethodInExistingType, createdTypeMethodToUpdate,
+                                             createdType, existingClosedTypesForGenericDeclaringType))
                                 {
-                                    LoggerScoped.LogWarning($"Method: '{matchingMethodInExistingType.FullDescription()}' is generic. Hot-Reload for generic methods is not supported yet, you won't see changes for that method.");
-                                    continue;
+                                    LoggerScoped.LogDebug($"Trying to detour method, from: '{detourPair.Key.FullDescription()}' to: '{detourPair.Value.FullDescription()}'");
+                                    DetourCrashHandler.LogDetour(detourPair.Key.ResolveFullName());
+                                    try
+                                    {
+                                        Memory.DetourMethod(detourPair.Key, detourPair.Value);
+                                    }
+                                    catch (Exception detourEx)
+                                    {
+                                        LoggerScoped.LogWarning($"Unable to detour method: '{detourPair.Key.FullDescription()}'. {detourEx.Message}");
+                                    }
                                 }
-
-                                if (matchingMethodInExistingType.DeclaringType != null && matchingMethodInExistingType.DeclaringType.IsGenericType)
-                                {
-                                    LoggerScoped.LogWarning($"Type for method: '{matchingMethodInExistingType.FullDescription()}' is generic. Hot-Reload for generic types is not supported yet, you won't see changes for that type.");
-                                    continue;
-                                }
-
-                                LoggerScoped.LogDebug($"Trying to detour method, from: '{matchingMethodInExistingType.FullDescription()}' to: '{createdTypeMethodToUpdate.FullDescription()}'");
-                                DetourCrashHandler.LogDetour(matchingMethodInExistingType.ResolveFullName());
-                                Memory.DetourMethod(matchingMethodInExistingType, createdTypeMethodToUpdate);
                             }
                             else 
                             {
@@ -151,6 +158,99 @@ namespace UnityReloader.Runtime
             return _existingTypeToRedirectedType.TryGetValue(forExistingType, out var redirectedType)
                 ? redirectedType
                 : null;
+        }
+
+        // Resolves the concrete (original, patched) method pairs to detour for a matched method.
+        // Harmony cannot detour an open generic method or a method on an open generic type - it must be bound to
+        // concrete type arguments first. This expands the open method into every detourable concrete instantiation.
+        private static IEnumerable<KeyValuePair<MethodBase, MethodBase>> ResolveConcreteDetourPairs(
+            MethodInfo existingOpenMethod, MethodInfo patchedOpenMethod,
+            Type patchedOpenType, List<Type> existingClosedTypes)
+        {
+            if (existingOpenMethod.IsGenericMethod)
+            {
+                // Generic-method instantiations are encoded as MethodSpec tokens in IL and are not enumerable via
+                // reflection, so the type arguments actually used at runtime cannot be discovered. A full recompile
+                // is required to apply changes to a generic method's body.
+                LoggerScoped.LogWarning($"Method: '{existingOpenMethod.FullDescription()}' is a generic method. " +
+                    "Its concrete instantiations can't be discovered at runtime, so its body can't be hot-reloaded - a full recompile is needed to apply the change.");
+                yield break;
+            }
+
+            if (existingClosedTypes == null)
+            {
+                // Declaring type is not generic - the method is already concrete.
+                yield return new KeyValuePair<MethodBase, MethodBase>(existingOpenMethod, patchedOpenMethod);
+                yield break;
+            }
+
+            // Method declared on a generic type: detour every discoverable constructed instantiation (e.g. Foo<int>).
+            foreach (var closedExistingType in existingClosedTypes)
+            {
+                var typeArgs = closedExistingType.GetGenericArguments();
+                Type closedPatchedType;
+                try
+                {
+                    closedPatchedType = patchedOpenType.MakeGenericType(typeArgs);
+                }
+                catch (Exception e)
+                {
+                    LoggerScoped.LogWarning($"Unable to construct patched generic type for '{closedExistingType}': {e.Message}");
+                    continue;
+                }
+
+                // MetadataToken is stable between an open type definition and its constructed instantiations,
+                // so it reliably maps the matched open method onto the closed method of each instantiation.
+                var closedExistingMethod = closedExistingType.GetMethods(ALL_DECLARED_METHODS_BINDING_FLAGS)
+                    .FirstOrDefault(m => m.MetadataToken == existingOpenMethod.MetadataToken);
+                var closedPatchedMethod = closedPatchedType.GetMethods(ALL_DECLARED_METHODS_BINDING_FLAGS)
+                    .FirstOrDefault(m => m.MetadataToken == patchedOpenMethod.MetadataToken);
+
+                if (closedExistingMethod != null && closedPatchedMethod != null)
+                    yield return new KeyValuePair<MethodBase, MethodBase>(closedExistingMethod, closedPatchedMethod);
+            }
+        }
+
+        // Finds constructed instantiations (e.g. Container<int>) of an open generic type definition that are reachable
+        // through loaded type metadata: as a base type, an implemented interface, or a field type. These are the
+        // instantiations a hot reload can rebind and detour.
+        private static List<Type> FindConstructedInstantiations(Type openGenericTypeDefinition)
+        {
+            var result = new HashSet<Type>();
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch
+                {
+                    continue; //some assemblies (eg dynamic) can throw on GetTypes - skip them
+                }
+
+                foreach (var t in types)
+                {
+                    CollectMatchingClosedType(t.BaseType, openGenericTypeDefinition, result);
+                    foreach (var implementedInterface in t.GetInterfaces())
+                        CollectMatchingClosedType(implementedInterface, openGenericTypeDefinition, result);
+                    foreach (var f in t.GetFields(ALL_BINDING_FLAGS))
+                        CollectMatchingClosedType(f.FieldType, openGenericTypeDefinition, result);
+                }
+            }
+
+            return result.ToList();
+        }
+
+        private static void CollectMatchingClosedType(Type candidate, Type openGenericTypeDefinition, HashSet<Type> into)
+        {
+            if (candidate != null
+                && candidate.IsGenericType
+                && !candidate.IsGenericTypeDefinition
+                && candidate.GetGenericTypeDefinition() == openGenericTypeDefinition)
+            {
+                into.Add(candidate);
+            }
         }
 
         private static bool DidFieldsOrPropertyCountChanged(Type createdType, Type matchingTypeInExistingAssemblies)
