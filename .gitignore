@@ -1,0 +1,26 @@
+# Unity generated
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/
+MemoryCaptures/
+Recordings/
+
+# Unity cache
+[Aa]ssets/AssetStoreTools*
+[Aa]ssets/Plugins/Editor/JetBrains*
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.suo
+*.user
+*.sln
+*.csproj
+
+# OS
+.DS_Store
+Thumbs.db
