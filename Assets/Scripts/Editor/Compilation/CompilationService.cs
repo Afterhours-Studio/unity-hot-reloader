@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using ImmersiveVRTools.Editor.Common.Utilities;
+using ImmersiveVRTools.Runtime.Common;
 using UnityReloader.Runtime;
 
 namespace UnityReloader.Editor.Compilation
