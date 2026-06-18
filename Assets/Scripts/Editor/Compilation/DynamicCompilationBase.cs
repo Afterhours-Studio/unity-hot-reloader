@@ -74,6 +74,7 @@ namespace UnityReloader.Editor.Compilation
         {
             var combinedUsingStatements = new List<string>();
             var typesDefined = new List<string>();
+            var perFileResults = new List<RewriteStepResult>();
 
             var trees = sourceCodeFiles
                     .Select(sourceCodeFile =>
@@ -176,39 +177,72 @@ namespace UnityReloader.Editor.Compilation
 #endif
                 }
 
+                var context = new RewriteContext(definedPreprocessorSymbols, DebugWriteRewriteReasonAsComment);
+
                 //WARN: application order is important, eg ctors need to happen before class names as otherwise ctors will not be recognised as ctors
+                var pipeline = new List<ISourceRewriter>();
+
                 if (UnityReloaderManager.Instance.EnableExperimentalThisCallLimitationFix)
                 {
-					root = new ThisCallRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
-					root = new ThisAssignmentRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
+                    pipeline.Add(new SyntaxRewriterAdapter("ThisCallRewriter",
+                        (r, _) => new ThisCallRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
+                    pipeline.Add(new SyntaxRewriterAdapter("ThisAssignmentRewriter",
+                        (r, _) => new ThisAssignmentRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
                 }
 
                 if (UnityReloaderManager.Instance.AssemblyChangesLoaderEditorOptionsNeededInBuild.EnableExperimentalAddedFieldsSupport)
                 {
-                    root = new NewFieldsRewriter(typeToNewFieldDeclarations, DebugWriteRewriteReasonAsComment).Visit(root);
-                    root = new CreateNewFieldInitMethodRewriter(typeToNewFieldDeclarations, DebugWriteRewriteReasonAsComment).Visit(root);
+                    pipeline.Add(new SyntaxRewriterAdapter("NewFieldsRewriter",
+                        (r, _) => new NewFieldsRewriter(typeToNewFieldDeclarations, DebugWriteRewriteReasonAsComment).Visit(r)));
+                    pipeline.Add(new SyntaxRewriterAdapter("CreateNewFieldInitMethodRewriter",
+                        (r, _) => new CreateNewFieldInitMethodRewriter(typeToNewFieldDeclarations, DebugWriteRewriteReasonAsComment).Visit(r)));
                 }
-                
-                root = new RedundantTypeNameQualifierRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
-                
-                root = new ConstructorRewriter(adjustCtorOnlyForNonNestedTypes: true, DebugWriteRewriteReasonAsComment).Visit(root);
-                
-                var hotReloadCompliantRewriter = new HotReloadCompliantRewriter(DebugWriteRewriteReasonAsComment);
-                root = hotReloadCompliantRewriter.Visit(root);
-                combinedUsingStatements.AddRange(hotReloadCompliantRewriter.StrippedUsingDirectives);
-                
-                root = new BuilderPatternFunctionsRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
-                root = new RecordeRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
-                root = new ExtensionMethodsCallingOtherExtensionMethodsInSameFileRewriter(DebugWriteRewriteReasonAsComment).Visit(root);
-                
+
+                pipeline.Add(new SyntaxRewriterAdapter("RedundantTypeNameQualifierRewriter",
+                    (r, _) => new RedundantTypeNameQualifierRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
+                pipeline.Add(new SyntaxRewriterAdapter("ConstructorRewriter",
+                    (r, _) => new ConstructorRewriter(adjustCtorOnlyForNonNestedTypes: true, DebugWriteRewriteReasonAsComment).Visit(r)));
+                pipeline.Add(new SyntaxRewriterAdapter("HotReloadCompliantRewriter", (r, ctx) =>
+                {
+                    var hotReloadCompliantRewriter = new HotReloadCompliantRewriter(DebugWriteRewriteReasonAsComment);
+                    var newRoot = hotReloadCompliantRewriter.Visit(r);
+                    ctx.StrippedUsingDirectives.AddRange(hotReloadCompliantRewriter.StrippedUsingDirectives);
+                    return newRoot;
+                }));
+                pipeline.Add(new SyntaxRewriterAdapter("BuilderPatternFunctionsRewriter",
+                    (r, _) => new BuilderPatternFunctionsRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
+                pipeline.Add(new SyntaxRewriterAdapter("RecordeRewriter",
+                    (r, _) => new RecordeRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
+                pipeline.Add(new SyntaxRewriterAdapter("ExtensionMethodsCallingOtherExtensionMethodsInSameFileRewriter",
+                    (r, _) => new ExtensionMethodsCallingOtherExtensionMethodsInSameFileRewriter(DebugWriteRewriteReasonAsComment).Visit(r)));
+
                 //processed as last step to simply rewrite all changes made before
                 if (TryResolveUserDefinedOverridesRoot(tree.FilePath, definedPreprocessorSymbols, out var userDefinedOverridesRoot))
                 {
-                    root = ProcessUserDefinedOverridesReplacements(tree.FilePath, root, userDefinedOverridesRoot);
-                    root = AddUserDefinedOverridenTypes(userDefinedOverridesRoot, root);
+                    var capturedOverridesRoot = userDefinedOverridesRoot;
+                    pipeline.Add(new SyntaxRewriterAdapter("ManualUserDefinedScriptOverridesRewriter", (r, _) =>
+                    {
+                        r = ProcessUserDefinedOverridesReplacements(tree.FilePath, r, capturedOverridesRoot);
+                        r = AddUserDefinedOverridenTypes(capturedOverridesRoot, r);
+                        return r;
+                    }));
                 }
 
-                return root.ToFullString();
+                var current = root.ToFullString();
+                foreach (var step in pipeline)
+                {
+                    var stepResult = step.Rewrite(current, context);
+                    perFileResults.Add(stepResult);
+                    if (stepResult.Status == RewriteStepStatus.Unsupported)
+                    {
+                        LoggerScoped.LogWarning($"File '{tree.FilePath}' failed at rewrite step '{stepResult.StepName}': {stepResult.DiagnosticMessage}");
+                        break;
+                    }
+                    current = stepResult.TransformedSource;
+                }
+
+                combinedUsingStatements.AddRange(context.StrippedUsingDirectives);
+                return current;
             }).ToList();
 
             var sourceCodeCombinedSb = new StringBuilder();
@@ -225,7 +259,7 @@ namespace UnityReloader.Editor.Compilation
             }
             
             LoggerScoped.LogDebug("Source Code Created:\r\n\r\n" + sourceCodeCombinedSb);
-            return new CreateSourceCodeCombinedContentsResult(sourceCodeCombinedSb.ToString(), typesDefined);
+            return new CreateSourceCodeCombinedContentsResult(sourceCodeCombinedSb.ToString(), typesDefined, perFileResults);
         }
 
         private static SyntaxNode AddUserDefinedOverridenTypes(SyntaxNode userDefinedOverridesRoot, SyntaxNode root)
@@ -364,11 +398,13 @@ namespace UnityReloader.Editor.Compilation
     {
         public string SourceCode { get; }
         public List<string> TypeNamesDefinitions { get; }
+        public List<RewriteStepResult> RewriteStepResults { get; }
 
-        public CreateSourceCodeCombinedContentsResult(string sourceCode, List<string> typeNamesDefinitions)
+        public CreateSourceCodeCombinedContentsResult(string sourceCode, List<string> typeNamesDefinitions, List<RewriteStepResult> rewriteStepResults)
         {
             SourceCode = sourceCode;
             TypeNamesDefinitions = typeNamesDefinitions;
+            RewriteStepResults = rewriteStepResults;
         }
     }
 

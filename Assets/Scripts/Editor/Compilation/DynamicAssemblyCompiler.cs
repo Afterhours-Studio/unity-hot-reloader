@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using UnityReloader.Editor.Compilation.CodeRewriting;
 using UnityReloader.Runtime;
 using ImmersiveVRTools.Runtime.Common;
 using ImmersiveVrToolsCommon.Runtime.Logging;
@@ -49,8 +50,9 @@ namespace UnityReloader.Editor.Compilation
         public string SourceCodeCombined { get; }
         public string SourceCodeCombinedFileLocation { get; }
         public float CreatingAssemblyWithInternalsVisibleToTook { get; }
+        public List<RewriteStepResult> RewriteStepResults { get; }
 
-        public CompileResult(string compiledAssemblyPath, List<string> messagesFromCompilerProcess, int nativeCompilerReturnValue, Assembly compiledAssembly, string sourceCodeCombined, string sourceCodeCombinedFileLocation, float creatingAssemblyWithInternalsVisibleToTook)
+        public CompileResult(string compiledAssemblyPath, List<string> messagesFromCompilerProcess, int nativeCompilerReturnValue, Assembly compiledAssembly, string sourceCodeCombined, string sourceCodeCombinedFileLocation, float creatingAssemblyWithInternalsVisibleToTook, List<RewriteStepResult> rewriteStepResults = null)
         {
             CompiledAssemblyPath = compiledAssemblyPath;
             MessagesFromCompilerProcess = messagesFromCompilerProcess;
@@ -59,6 +61,7 @@ namespace UnityReloader.Editor.Compilation
             SourceCodeCombined = sourceCodeCombined;
             SourceCodeCombinedFileLocation = sourceCodeCombinedFileLocation;
             CreatingAssemblyWithInternalsVisibleToTook = creatingAssemblyWithInternalsVisibleToTook;
+            RewriteStepResults = rewriteStepResults;
         }
     }
 }

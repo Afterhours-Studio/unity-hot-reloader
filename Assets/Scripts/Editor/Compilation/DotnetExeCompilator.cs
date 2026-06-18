@@ -130,7 +130,7 @@ namespace UnityReloader.Editor.Compilation
 
                 var compiledAssembly = Assembly.LoadFrom(outLibraryPath);
                 return new CompileResult(outLibraryPath, outputMessages, exitCode, compiledAssembly, createSourceCodeCombinedResult.SourceCode,
-                    sourceCodeCombinedFilePath, createInternalVisibleToAsmElapsedMilliseconds);
+                    sourceCodeCombinedFilePath, createInternalVisibleToAsmElapsedMilliseconds, createSourceCodeCombinedResult.RewriteStepResults);
             }
             catch (SourceCodeHasErrorsException e)
             {
