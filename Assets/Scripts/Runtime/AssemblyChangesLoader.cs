@@ -54,9 +54,11 @@ namespace UnityReloader.Runtime
         // to a full Unity recompile.
         public bool LastUpdateHadStructuralChange { get; private set; }
 
-        public void DynamicallyUpdateMethodsForCreatedAssembly(Assembly dynamicallyLoadedAssemblyWithUpdates, AssemblyChangesLoaderEditorOptionsNeededInBuild editorOptions)
+        public PatchResult DynamicallyUpdateMethodsForCreatedAssembly(Assembly dynamicallyLoadedAssemblyWithUpdates, AssemblyChangesLoaderEditorOptionsNeededInBuild editorOptions)
         {
             LastUpdateHadStructuralChange = false;
+            var applied = new List<ChangeClassification>();
+            var fallenBack = new List<ChangeClassification>();
             try
             {
                 var sw = new Stopwatch();
@@ -75,12 +77,12 @@ namespace UnityReloader.Runtime
                         LoggerScoped.Log($"Type: {createdType.Name} marked as {nameof(PreventHotReload)} - ignoring change.");
                         continue;
                     }
-                    
+
                     var createdTypeNameWithoutPatchedPostfix = RemoveClassPostfix(createdType.FullName);
                     if (ProjectTypeCache.AllTypesInNonDynamicGeneratedAssemblies.TryGetValue(createdTypeNameWithoutPatchedPostfix, out var matchingTypeInExistingAssemblies))
                     {
                         _existingTypeToRedirectedType[matchingTypeInExistingAssemblies] = createdType;
-                        
+
                         if (!editorOptions.IsDidFieldsOrPropertyCountChangedCheckDisabled
                             && !editorOptions.EnableExperimentalAddedFieldsSupport
                             && (DidFieldsOrPropertyCountChanged(createdType, matchingTypeInExistingAssemblies)
@@ -89,6 +91,7 @@ namespace UnityReloader.Runtime
                             // Structural change (added/removed/retyped field, or [SerializeField] toggle):
                             // detour can't apply it. Flag for a full recompile and skip detouring this type.
                             LastUpdateHadStructuralChange = true;
+                            fallenBack.Add(ChangeClassification.FieldSignature);
                             continue;
                         }
 
@@ -110,6 +113,7 @@ namespace UnityReloader.Runtime
                                 .SingleOrDefault(m => m.FullDescription() == createdTypeMethodToUpdateFullDescriptionWithoutPatchedClassPostfix);
                             if (matchingMethodInExistingType != null)
                             {
+                                var anyDetoursApplied = false;
                                 foreach (var detourPair in ResolveConcreteDetourPairs(
                                              matchingMethodInExistingType, createdTypeMethodToUpdate,
                                              createdType, existingClosedTypesForGenericDeclaringType))
@@ -119,12 +123,18 @@ namespace UnityReloader.Runtime
                                     try
                                     {
                                         Memory.DetourMethod(detourPair.Key, detourPair.Value);
+                                        anyDetoursApplied = true;
                                     }
                                     catch (Exception detourEx)
                                     {
                                         LoggerScoped.LogWarning($"Unable to detour method: '{detourPair.Key.FullDescription()}'. {detourEx.Message}");
                                     }
                                 }
+
+                                if (anyDetoursApplied)
+                                    applied.Add(ChangeClassification.MethodBody);
+                                else if (matchingMethodInExistingType.IsGenericMethod)
+                                    fallenBack.Add(ChangeClassification.GenericMethod);
                             }
                             else
                             {
@@ -137,15 +147,17 @@ namespace UnityReloader.Runtime
                                 if (createdTypeMethodToUpdate.IsPrivate)
                                 {
                                     LoggerScoped.LogDebug($"New private method '{createdTypeMethodToUpdate.Name}' in '{matchingTypeInExistingAssemblies.Name}' hot-reloaded (usable within its declaring type).");
+                                    applied.Add(ChangeClassification.NewPrivateMethod);
                                 }
                                 else
                                 {
                                     LastUpdateHadStructuralChange = true;
                                     LoggerScoped.Log($"New externally-callable method '{createdTypeMethodToUpdate.Name}' detected in '{matchingTypeInExistingAssemblies.Name}' - triggering a full recompile so it's available to all scripts.");
+                                    fallenBack.Add(ChangeClassification.NewPublicMethod);
                                 }
                             }
                         }
-                        
+
                         FindAndExecuteStaticOnScriptHotReloadNoInstance(createdType);
                         FindAndExecuteOnScriptHotReload(matchingTypeInExistingAssemblies, createdType);
                     }
@@ -163,14 +175,16 @@ namespace UnityReloader.Runtime
                         }
                         else
                         {
-                            LoggerScoped.LogWarning($"FSR: Unable to find existing type for: '{createdType.FullName}', this is not an issue if you added new type. <color=orange>If it's an existing type please do a full domain-reload - one of optimisations is to cache existing types for later lookup on first call.</color>");
+                            LoggerScoped.LogWarning($"UnityReloader: New type '{createdType.FullName}' detected - no existing type to detour into. If this is an existing type, a full domain reload may be needed.");
+                            applied.Add(ChangeClassification.NewType);
                         }
                         FindAndExecuteStaticOnScriptHotReloadNoInstance(createdType);
                         FindAndExecuteOnScriptHotReload(createdType, createdType);
                     }
                 }
-                
+
                 LoggerScoped.Log($"Hot-reload completed (took {sw.ElapsedMilliseconds}ms)");
+                return PatchResult.Succeeded(applied.ToArray(), fallenBack.ToArray());
             }
             finally
             {
@@ -418,7 +432,7 @@ namespace UnityReloader.Runtime
     public interface IAssemblyChangesLoader
     {
         bool LastUpdateHadStructuralChange { get; }
-        void DynamicallyUpdateMethodsForCreatedAssembly(Assembly dynamicallyLoadedAssemblyWithUpdates, AssemblyChangesLoaderEditorOptionsNeededInBuild editorOptions);
+        PatchResult DynamicallyUpdateMethodsForCreatedAssembly(Assembly dynamicallyLoadedAssemblyWithUpdates, AssemblyChangesLoaderEditorOptionsNeededInBuild editorOptions);
     }
     
     [Serializable]
