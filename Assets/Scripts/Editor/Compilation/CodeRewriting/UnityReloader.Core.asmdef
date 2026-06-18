@@ -1,23 +1,20 @@
 {
-    "name": "UnityReloader.Editor",
+    "name": "UnityReloader.Core",
     "rootNamespace": "",
     "references": [
-        "GUID:b75b497805046c443a21f90e84a5ff4f",
-        "UnityReloader.Core"
+        "GUID:b75b497805046c443a21f90e84a5ff4f"
     ],
     "includePlatforms": [
         "Editor"
     ],
     "excludePlatforms": [],
-    "allowUnsafeCode": true,
+    "allowUnsafeCode": false,
     "overrideReferences": true,
     "precompiledReferences": [
-        "0Harmony.dll",
         "Microsoft.CodeAnalysis.FSR.dll",
         "Microsoft.CodeAnalysis.CSharp.FSR.dll",
-        "ImmersiveVRTools.Common.Editor.dll",
-        "ImmersiveVRTools.Common.Runtime.dll",
-        "System.Collections.Immutable.FSR.dll"
+        "System.Collections.Immutable.FSR.dll",
+        "ImmersiveVRTools.Common.Runtime.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],
