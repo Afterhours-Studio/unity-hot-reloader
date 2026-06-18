@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.3.0] - 2026-06-18
+
+### Changed
+- Split `UnityReloaderManager` god class into five focused services injected via constructor:
+  - `FileChangeSource` - owns `FileSystemWatcher` lifecycle, workaround for Unity file-path bug, path-token resolution, and the enqueue side of the pending-changes queue.
+  - `ChangeBatcher` - drains the `ConcurrentQueue` on the main thread each `Update` tick, applies exclusion filtering and duplicate-detection debounce, and owns `_dynamicFileHotReloadStateEntries`.
+  - `CompilationService` - runs `SourceChangeClassifier.Classify`, produces a `CompilationServiceResult` (plan log + early-exit flag + `CompileResult`), and delegates to `DynamicAssemblyCompiler.Compile`.
+  - `PatchApplicator` - thin wrapper around `IAssemblyChangesLoader.DynamicallyUpdateMethodsForCreatedAssembly`, returns `PatchResult`.
+  - `FallbackRecompileService` - holds the thread-safe `_fullRecompileRequestedAfterFailure` flag; `Request()` is called from the background compile thread, `ProcessIfPending()` is called on the main thread in `Update` and triggers `CompilationPipeline.RequestScriptCompilation` when appropriate.
+- `UnityReloaderManager` is now a thin orchestrator: wires services together in `Update` and `TriggerReloadForChangedFiles`, manages play-mode state, and exposes public API (`HotReloadSucceeded`, `HotReloadFailed`, `AddFileChangeToProcess`, all `[MenuItem]` methods) unchanged.
+- No services use static singletons internally - only `UnityReloaderManager` itself remains a singleton.
+- Zero behavior change: all existing preferences, events, and menu items are preserved.
+
+## [1.2.2] - 2026-06-17
+
+### Added
+- `ISourceRewriter` interface (`Rewrite(string sourceCode, RewriteContext context) : RewriteStepResult`) establishing a clear per-step contract for the source rewriting pipeline.
+- `RewriteStepResult` with `Status` (`Changed`, `NoOp`, `Warning`, `Unsupported`), `TransformedSource`, `DiagnosticMessage`, and `StepName`. Factory helpers: `Changed`, `NoOp`, `Unsupported`.
+- `RewriteContext` carries pipeline inputs (`PreprocessorSymbols`, `WriteRewriteReasonAsComment`) and collects out-of-band side effects (`StrippedUsingDirectives`) from rewriters that produce them.
+- `SyntaxRewriterAdapter` wraps any `Func<SyntaxNode, RewriteContext, SyntaxNode>` as an `ISourceRewriter`. Each call re-parses the incoming string to a fresh `SyntaxTree`, applies the transform, and emits `Changed` or `NoOp` based on whether the output differs.
+- All 10 rewriter calls in `DynamicCompilationBase.CreateSourceCodeCombinedContents` are now wrapped as `SyntaxRewriterAdapter` entries in an ordered `List<ISourceRewriter>`. Results are collected per step. If any step returns `Unsupported`, a warning is logged (`"File '...' failed at rewrite step '...':"`) and the pipeline halts for that file.
+- `CompileResult` gains a `List<RewriteStepResult> RewriteStepResults` property, populated from the pipeline run, for logging and diagnostics.
+
+## [1.2.1] - 2026-06-17
+
+### Added
+- Pre-compile capability layer (`SourceChangeClassifier`) that parses changed source files with Roslyn `SyntaxTree` (no semantic model) and classifies every change before compilation starts. Detects: `MethodBody`, `NewPrivateMethod`, `NewPublicMethod`, `FieldSignature`, `NewType`, `GenericMethod`, or `Unknown`. Classification is compared against the currently loaded assembly via reflection.
+- Pre-compile log emitted before every hot reload batch. Example: "Hot reload pre-analysis: Foo.cs: Method body change 'Update' in 'Foo' - will hot reload; New public/protected/internal method 'Bar' in 'Foo' - requires full recompile. -> structural changes detected - will skip hot compile and request full recompile."
+- Early-exit optimisation: when pre-compile analysis determines `RequiresFullRecompile`, `DynamicAssemblyCompiler.Compile` is skipped entirely. `CompilationPipeline.RequestScriptCompilation()` is dispatched to the main thread immediately, avoiding an unnecessary Roslyn compile followed by a second Unity recompile.
+
+## [1.2.0] - 2026-06-17
+
+### Changed
+- Extracted all Roslyn source-rewriting code into a new `UnityReloader.Core` assembly (`Assets/Scripts/Editor/Compilation/CodeRewriting/`). The assembly covers every rewriter, walker, and partial-class combiner (21 files). It references `UnityReloader.Runtime` for shared constants and carries its own Roslyn precompiled references (`Microsoft.CodeAnalysis`, `CSharp`, `System.Collections.Immutable`). `UnityReloader.Editor` now lists `UnityReloader.Core` as a reference.
+- No source-code changes: rewriter files retain their `UnityReloader.Editor.Compilation.CodeRewriting` namespace. Zero behavior change - the split is purely at the assembly boundary.
+- The new assembly has no `#if UNITY_EDITOR` guards and no `UnityEditor` namespace usage. It can be referenced by an Editor test assembly without pulling in any Editor-API dependencies, making signature comparison, source rewriting, and partial-class merging independently testable.
+
+## [1.1.1] - 2026-06-17
+
+### Added
+- `ChangeClassification` enum (`MethodBody`, `NewPrivateMethod`, `NewPublicMethod`, `FieldSignature`, `NewType`, `GenericMethod`, `Unknown`) in `UnityReloader.Runtime`.
+- `HotReloadPlan` model (placeholder for the upcoming pre-compile capability pass).
+- `PatchResult` model exposing `Applied` and `FallenBackToRecompile` classification arrays, with `Succeeded`/`Failed` factory helpers.
+- `DynamicallyUpdateMethodsForCreatedAssembly` now returns `PatchResult` instead of `void`. Each decision point records the appropriate classification: `FieldSignature` on structural-change bail-out, `MethodBody` per successful detour, `GenericMethod` for undetourable generic methods, `NewPrivateMethod` / `NewPublicMethod` for newly added methods, and `NewType` for unmatched user types.
+- `UnityReloaderManager` now logs a summary when any changes fall back to full recompile, showing applied vs. fallen-back counts and the classification list.
+- Updated "FSR: Unable to find existing type" warning to use cleaner `UnityReloader:` prefix.
+
 ## [1.1.0] - 2026-06-17
 
 ### Fixed

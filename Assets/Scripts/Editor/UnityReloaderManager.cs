@@ -36,18 +36,17 @@ namespace UnityReloader.Editor
         }
 
         private static string DataPath = Application.dataPath;
-        
 
         public const string FileWatcherReplacementTokenForApplicationDataPath = "<Application.dataPath>";
         private const int BaseMenuItemPriority_ManualScriptOverride = 100;
         private const int BaseMenuItemPriority_Exclusions = 200;
         private const int BaseMenuItemPriority_FileWatcher = 300;
-        
+
         public Dictionary<string, Func<string>> FileWatcherTokensToResolvePathFn = new Dictionary<string, Func<string>>
         {
             [FileWatcherReplacementTokenForApplicationDataPath] = () => DataPath
         };
-        
+
         private Dictionary<string, DynamicFileHotReloadState> _lastProcessedDynamicFileHotReloadStatesInSession = new Dictionary<string, DynamicFileHotReloadState>();
         public IReadOnlyDictionary<string, DynamicFileHotReloadState> LastProcessedDynamicFileHotReloadStatesInSession => _lastProcessedDynamicFileHotReloadStatesInSession;
         public event Action<List<DynamicFileHotReloadState>> HotReloadFailed;
@@ -55,89 +54,43 @@ namespace UnityReloader.Editor
 
         private bool _wasLockReloadAssembliesCalled;
         private PlayModeStateChange _lastPlayModeStateChange;
-        private List<IDisposable> _fileWatchers = new List<IDisposable>();
         private IEnumerable<string> _currentFileExclusions;
         private int _triggerDomainReloadIfOverNDynamicallyLoadedAssembles = 100;
         public bool EnableExperimentalThisCallLimitationFix { get; private set; }
         public bool IsPartialClassSupportEnabled { get; private set; }
 #pragma warning disable 0618
         public AssemblyChangesLoaderEditorOptionsNeededInBuild AssemblyChangesLoaderEditorOptionsNeededInBuild { get; private set; } = new AssemblyChangesLoaderEditorOptionsNeededInBuild();
-
 #pragma warning restore 0618
-
-        private List<DynamicFileHotReloadState> _dynamicFileHotReloadStateEntries = new List<DynamicFileHotReloadState>();
-        // Paths enqueued by background watcher threads; drained on the main thread each Update tick.
-        private readonly ConcurrentQueue<string> _pendingFileChangePaths = new ConcurrentQueue<string>();
 
         private DateTime _lastTimeChangeBatchRun = default(DateTime);
         private bool _assemblyChangesLoaderResolverResolutionAlreadyCalled;
         private volatile bool _isEditorModeHotReloadEnabled;
-
-        // Set on the background compile thread when a hot-reload fails; consumed on the
-        // main thread in Update to trigger a full Unity recompile fallback (needed because
-        // the tool disables Unity asset auto-refresh, so nothing else would apply the change).
-        private volatile bool _fullRecompileRequestedAfterFailure;
         private int _hotReloadPerformedCount = 0;
         private bool _isOnDemandHotReloadEnabled;
 
-        private void OnWatchedFileChange(object source, FileSystemEventArgs e)
-        {
-            if (ShouldIgnoreFileChange()) return;
+        private readonly FileChangeSource _fileChangeSource;
+        private readonly ChangeBatcher _changeBatcher;
+        private readonly CompilationService _compilationService;
+        private readonly PatchApplicator _patchApplicator;
+        private readonly FallbackRecompileService _fallbackRecompileService;
 
-            var filePathToUse = e.FullPath;
-            if (!File.Exists(filePathToUse))
-            {
-                if (!TryWorkaroundForUnityFileWatcherBug(e, ref filePathToUse)) 
-                    return;
-            }
-            
-            AddFileChangeToProcess(filePathToUse);
+        private UnityReloaderManager()
+        {
+            var pendingFileChangePaths = new ConcurrentQueue<string>();
+            _fileChangeSource = new FileChangeSource(
+                pendingFileChangePaths,
+                ShouldIgnoreFileChange,
+                FileWatcherTokensToResolvePathFn,
+                DataPath);
+            _changeBatcher = new ChangeBatcher(pendingFileChangePaths, ShouldIgnoreFileChange);
+            _compilationService = new CompilationService();
+            _patchApplicator = new PatchApplicator();
+            _fallbackRecompileService = new FallbackRecompileService();
         }
 
         public void AddFileChangeToProcess(string filePath)
         {
-            if (!File.Exists(filePath))
-            {
-                LoggerScoped.LogWarning($"Specified file: '{filePath}' does not exist. Hot-Reload will not be performed.");
-                return;
-            }
-
-            // Fast-path: skip obviously ignorable changes before touching the queue.
-            // ShouldIgnoreFileChange reads volatile/_lastPlayModeStateChange which is benign
-            // from a background thread (worst case: one extra enqueue that gets filtered on drain).
-            if (ShouldIgnoreFileChange()) return;
-
-            _pendingFileChangePaths.Enqueue(filePath);
-        }
-
-        // Called on main thread each Update tick. Applies exclusion, debounce, and ignore checks
-        // before committing to _dynamicFileHotReloadStateEntries (which is main-thread-only).
-        private void DrainPendingFileChanges()
-        {
-            const int msThresholdToConsiderSameChangeFromDifferentFileWatchers = 500;
-            while (_pendingFileChangePaths.TryDequeue(out var filePath))
-            {
-                if (ShouldIgnoreFileChange()) continue;
-
-                if (_currentFileExclusions != null && _currentFileExclusions.Any(fp => filePath.Replace("\\", "/").EndsWith(fp)))
-                {
-                    LoggerScoped.LogWarning($"UnityReloader: File: '{filePath}' changed, but marked as exclusion. Hot-Reload will not be performed. You can manage exclusions via" +
-                                            $"\r\nRight click context menu (Unity Reloader > Add / Remove Hot-Reload exclusion)" +
-                                            $"\r\nor via Tools -> Unity Reloader -> Start Screen -> Exclusion menu");
-                    continue;
-                }
-
-                var isDuplicate = _dynamicFileHotReloadStateEntries
-                    .Any(f => f.FullFileName == filePath
-                              && (DateTime.UtcNow - f.FileChangedOn).TotalMilliseconds < msThresholdToConsiderSameChangeFromDifferentFileWatchers);
-                if (isDuplicate)
-                {
-                    LoggerScoped.LogWarning($"UnityReloader: Looks like change to: {filePath} have already been added for processing. This can happen if you have multiple file watchers set in a way that they overlap.");
-                    continue;
-                }
-
-                _dynamicFileHotReloadStateEntries.Add(new DynamicFileHotReloadState(filePath, DateTime.UtcNow));
-            }
+            _fileChangeSource.AddFileChangeToProcess(filePath);
         }
 
         public bool ShouldIgnoreFileChange()
@@ -145,117 +98,12 @@ namespace UnityReloader.Editor
             if (!_isEditorModeHotReloadEnabled && _lastPlayModeStateChange != PlayModeStateChange.EnteredPlayMode)
             {
 #if ImmersiveVrTools_DebugEnabled
-            LoggerScoped.Log($"Application not playing, change to: {e.Name} won't be compiled and hot reloaded");
+                LoggerScoped.Log($"Application not playing, change won't be compiled and hot reloaded");
 #endif
                 return true;
             }
 
             return false;
-        }
-
-        private void StartWatchingDirectoryAndSubdirectories(string directoryPath, string filter, bool includeSubdirectories) 
-        {
-            foreach (var kv in FileWatcherTokensToResolvePathFn)
-            {
-                directoryPath = directoryPath.Replace(kv.Key, kv.Value());
-            }
-            
-            var directoryInfo = new DirectoryInfo(directoryPath);
-            if (!directoryInfo.Exists)
-            {
-                LoggerScoped.LogWarning($"UnityReloader: Directory: '{directoryPath}' does not exist, make sure file-watcher setup is correct. You can access via: Tools -> Unity Reloader -> File Watcher (Advanced Setup)");
-            }
-
-            switch ((FileWatcherImplementation)UnityReloaderPreference.FileWatcherImplementationInUse.GetEditorPersistedValueOrDefault())
-            {
-                case FileWatcherImplementation.UnityDefault:
-                    var fileWatcher = new FileSystemWatcher();
-
-                    fileWatcher.Path = directoryInfo.FullName;
-                    fileWatcher.IncludeSubdirectories = includeSubdirectories;
-                    fileWatcher.Filter =  filter;
-                    fileWatcher.NotifyFilter = NotifyFilters.LastWrite;
-                    fileWatcher.Changed += OnWatchedFileChange;
-        
-                    fileWatcher.EnableRaisingEvents = true;
-        
-                    _fileWatchers.Add(fileWatcher);
-                    
-                    break;
-#if UNITY_2021_1_OR_NEWER && UNITY_EDITOR_WIN
-                case FileWatcherImplementation.DirectWindowsApi: 
-                // On Windows, this is a WindowsFileSystemWatcher.
-                // On other platforms, it's the default Mono implementation.
-                // The WindowsFileSystemWatcher has much lower latency on Windows.
-                // However, there's a small issue:
-                // The WindowsFileSystemWatcher can, theoretically, miss events.
-                // This is true in Microsoft's implementation as well as ours.
-                // (Actually, ours should be slightly better.)
-                // This can happen if a change occurs during the brief moment
-                // during which the previous batch of changes are being
-                // recorded and queued.
-                // It can also happen if too many changes occur at once, overwhelming
-                // the buffer.
-                // People seem to routinely use the basic MS filewatcher and ignore
-                // these issues, treating them as acceptably unlikely.
-                // Our current implementation here does that too, but we may want
-                // to look at eliminating this issue.
-                // Unfortunately, it's a limitation of the Windows API, and to
-                // my knowledge can't be avoided directly.
-                // The solution is to combine the file watcher with a polling
-                // mechanism which can (slowly, but reliably) catch any missed events.
-                var windowsFileSystemWatcher = new WindowsFileSystemWatcher()
-                {
-                    Path = directoryInfo.FullName,
-                    IncludeSubdirectories = includeSubdirectories,
-                    Filter = filter,
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName
-                };
-                windowsFileSystemWatcher.Changed += OnWatchedFileChange;
-
-                // Visual Studio is annoying.
-                // It doesn't actually trigger a nice Changed event.
-                // Instead, it goes through some elaborate procedure.
-                // When changing player.cs, it does:
-                // CREATE: Code\ua4tt1aw.4ae~
-                // CHANGE: Code\ua4tt1aw.4ae~
-                // CREATE: Code\Player.cs~RF70560f7.TMP
-                // REMOVE: Code\Player.cs~RF70560f7.TMP
-                // RENAME: Code\Player.cs -> Code\Player.cs~RF70560f7.TMP
-                // RENAME: Code\ua4tt1aw.4ae~ -> Code\Player.cs
-                // REMOVE: Code\Player.cs~RF70560f7.TMP - again, somehow?
-                //
-                // This was fine before, because the watcher implementation was polling.
-                // I guess this usually happens fast between polls, so it just looks like a change.
-                // Note that that may mean there's a potential bug if polling happens in the middle of this procedure.
-                //
-                // This fix is a temporary measure.
-                // We should probably think more seriously about maybe being able to catch file additions and renames.
-                // If we dealt with those extra events smoothly, this would probably just work.
-                //
-                // Other IDEs may do similar but different things. We want a general purpose solution, not a VS specific one.
-                // Perhaps the approach should be to keep track of touched files, then do some diff procedure to work out what's happened to them?
-                // This could, perhaps, be integrated into the file watcher robustness polling solution discussed above.
-                // The two systems share a need for some type of event debouncing.
-                windowsFileSystemWatcher.Renamed += (source, e) =>
-                {
-                    if (e.Name.EndsWith(".cs"))
-                        OnWatchedFileChange(source, e);
-                };
-        
-                windowsFileSystemWatcher.EnableRaisingEvents = true;
-                                    
-                _fileWatchers.Add(windowsFileSystemWatcher);
-                break;
-#endif
-                
-                case FileWatcherImplementation.CustomPolling:
-                    CustomFileWatcher.InitializeSingularFilewatcher(directoryPath, filter, includeSubdirectories);
-                    break;
-                
-                default:
-                    throw new ArgumentOutOfRangeException();
-            }
         }
 
         static UnityReloaderManager()
@@ -301,7 +149,7 @@ namespace UnityReloader.Editor
 
         ~UnityReloaderManager()
         {
-            LoggerScoped.LogDebug("Destroying FSR Manager "); 
+            LoggerScoped.LogDebug("Destroying FSR Manager ");
             if (_instance != null)
             {
                 if (_lastPlayModeStateChange == PlayModeStateChange.EnteredPlayMode)
@@ -309,7 +157,7 @@ namespace UnityReloader.Editor
                     LoggerScoped.LogError("Manager is being destroyed in play session, this indicates some sort of issue where static variables were reset, hot reload will not function properly please reset. " +
                                           "This is usually caused by Unity triggering that reset for some reason that's outside of asset control - other static variables will also be affected and recovering just hot reload would hide wider issue.");
                 }
-                ClearFileWatchers();
+                _fileChangeSource.Clear();
             }
         }
 
@@ -321,7 +169,7 @@ namespace UnityReloader.Editor
             {
                 return false;
             }
-            
+
             Menu.SetChecked(WatchSpecificFileOrFolderMenuItemName, false);
 
             var isSelectionContaininingFolderOrScript = false;
@@ -369,7 +217,7 @@ namespace UnityReloader.Editor
                     {
                         UnityReloaderPreference.FileWatcherSetupEntries.AddElement(JsonUtility.ToJson(foundFileWatcherSetupEntry));
                     }
-                    
+
                     isFileWatchersChange = true;
                 }
                 else if (Selection.objects[i] is DefaultAsset selectedAsset)
@@ -382,7 +230,7 @@ namespace UnityReloader.Editor
                     {
                         UnityReloaderPreference.FileWatcherSetupEntries.AddElement(JsonUtility.ToJson(foundFileWatcherSetupEntry));
                     }
-                    
+
                     isFileWatchersChange = true;
                 }
             }
@@ -433,13 +281,13 @@ namespace UnityReloader.Editor
                 ScriptGenerationOverridesManager.AddScriptOverride(script);
             }
         }
-        
+
         [MenuItem("Assets/Unity Reloader/Add \\ Open User Script Rewrite Override", true)]
         public static bool AddHotReloadManualScriptOverrideValidateFn()
         {
             return Selection.activeObject is MonoScript;
         }
-        
+
         [MenuItem("Assets/Unity Reloader/Remove User Script Rewrite Override", false, BaseMenuItemPriority_ManualScriptOverride + 2)]
         public static void RemoveHotReloadManualScriptOverride()
         {
@@ -448,13 +296,13 @@ namespace UnityReloader.Editor
                 ScriptGenerationOverridesManager.TryRemoveScriptOverride(script);
             }
         }
-        
+
         [MenuItem("Assets/Unity Reloader/Remove User Script Rewrite Override", true)]
         public static bool RemoveHotReloadManualScriptOverrideValidateFn()
         {
             if (Selection.activeObject is MonoScript script)
             {
-                return ScriptGenerationOverridesManager.TryGetScriptOverride(  
+                return ScriptGenerationOverridesManager.TryGetScriptOverride(
                     new FileInfo(Path.Combine(Path.Combine(Application.dataPath + "//..", AssetDatabase.GetAssetPath(script)))),
                     out var _
                 );
@@ -462,14 +310,14 @@ namespace UnityReloader.Editor
 
             return false;
         }
-        
+
         [MenuItem("Assets/Unity Reloader/Show User Script Rewrite Overrides", false, BaseMenuItemPriority_ManualScriptOverride + 3)]
         public static void ShowManualScriptRewriteOverridesInUi()
         {
             var window = UnityReloaderWindow.Open();
             window.OpenExclusionsTab();
         }
-        
+
         [MenuItem("Assets/Unity Reloader/Add Hot-Reload Exclusion", false, BaseMenuItemPriority_Exclusions + 1)]
         public static void AddFileAsExcluded()
         {
@@ -489,7 +337,7 @@ namespace UnityReloader.Editor
         {
             UnityReloaderPreference.FilesExcludedFromHotReload.RemoveElement(ResolveRelativeToAssetDirectoryFilePath(Selection.activeObject));
         }
-    
+
         [MenuItem("Assets/Unity Reloader/Remove Hot-Reload Exclusion", true)]
         public static bool RemoveFileAsExcludedValidateFn()
         {
@@ -497,14 +345,14 @@ namespace UnityReloader.Editor
                    && ((UnityReloaderPreference.FilesExcludedFromHotReload.GetEditorPersistedValueOrDefault() as IEnumerable<string>) ?? Array.Empty<string>())
                    .Contains(ResolveRelativeToAssetDirectoryFilePath(Selection.activeObject));
         }
-    
+
         [MenuItem("Assets/Unity Reloader/Show Exclusions", false, BaseMenuItemPriority_Exclusions + 3)]
         public static void ShowExcludedFilesInUi()
         {
             var window = UnityReloaderWindow.Open();
             window.OpenExclusionsTab();
         }
-        
+
         private static string ResolveRelativeToAssetDirectoryFilePath(UnityEngine.Object obj)
         {
             // Object overload works on all Unity versions and avoids the obsolete int/EntityId overloads.
@@ -513,24 +361,14 @@ namespace UnityReloader.Editor
 
         public void Update()
         {
-            if (_fullRecompileRequestedAfterFailure)
-            {
-                _fullRecompileRequestedAfterFailure = false;
-                if ((bool)UnityReloaderPreference.AutoRecompileOnHotReloadFailure.GetEditorPersistedValueOrDefault()
-                    && !EditorApplication.isCompiling
-                    && !EditorApplication.isUpdating)
-                {
-                    LoggerScoped.LogWarning("Unity Reloader: hot reload failed - triggering a full recompile so the change is applied (Unity auto-refresh is off).");
-                    CompilationPipeline.RequestScriptCompilation();
-                }
-            }
+            _fallbackRecompileService.ProcessIfPending();
 
             _isEditorModeHotReloadEnabled = (bool)UnityReloaderPreference.EnableExperimentalEditorHotReloadSupport.GetEditorPersistedValueOrDefault();
-            if (_lastPlayModeStateChange == PlayModeStateChange.ExitingPlayMode && Instance._fileWatchers.Any())
+            if (_lastPlayModeStateChange == PlayModeStateChange.ExitingPlayMode && _fileChangeSource.WatcherCount > 0)
             {
                 ClearFileWatchers();
             }
-            
+
             if (!_isEditorModeHotReloadEnabled && !EditorApplication.isPlaying)
             {
                 return;
@@ -538,23 +376,15 @@ namespace UnityReloader.Editor
 
             if (_isEditorModeHotReloadEnabled)
             {
-                EnsureInitialized();
+                _fileChangeSource.EnsureInitialized();
             }
             else if (_lastPlayModeStateChange == PlayModeStateChange.EnteredPlayMode)
             {
-
-                EnsureInitialized();
-
-                // if (_lastPlayModeStateChange != PlayModeStateChange.ExitingPlayMode && Application.isPlaying && Instance._fileWatchers.Count == 0 && UnityReloaderPreference.FileWatcherSetupEntries.GetElementsTyped().Count > 0)
-                // {
-                //     LoggerScoped.LogWarning("Reinitializing file-watchers as defined configuration does not match current instance setup. If hot reload still doesn't work you'll need to reset play session.");
-                //     ClearFileWatchers();
-                //     EnsureInitialized();
-                // }
+                _fileChangeSource.EnsureInitialized();
             }
-            
+
             AssignConfigValuesThatCanNotBeAccessedOutsideOfMainThread();
-            DrainPendingFileChanges();
+            _changeBatcher.Drain(_currentFileExclusions);
 
             if (!_assemblyChangesLoaderResolverResolutionAlreadyCalled)
             {
@@ -568,20 +398,15 @@ namespace UnityReloader.Editor
                 TriggerReloadForChangedFiles();
             }
         }
-        
+
         private static void ClearFileWatchers()
         {
-            foreach (var fileWatcher in Instance._fileWatchers)
-            {
-                fileWatcher.Dispose();
-            }
-
-            Instance._fileWatchers.Clear();
+            Instance._fileChangeSource.Clear();
         }
 
         private void AssignConfigValuesThatCanNotBeAccessedOutsideOfMainThread()
         {
-            //TODO: PERF: needed in file watcher but when run on non-main thread causes exception. 
+            //TODO: PERF: needed in file watcher but when run on non-main thread causes exception.
             _currentFileExclusions = UnityReloaderPreference.FilesExcludedFromHotReload.GetElements();
             _triggerDomainReloadIfOverNDynamicallyLoadedAssembles = (int)UnityReloaderPreference.TriggerDomainReloadIfOverNDynamicallyLoadedAssembles.GetEditorPersistedValueOrDefault();
             _isOnDemandHotReloadEnabled = (bool)UnityReloaderPreference.EnableOnDemandReload.GetEditorPersistedValueOrDefault();
@@ -609,9 +434,9 @@ namespace UnityReloader.Editor
 #endif
                 ClearLastProcessedDynamicFileHotReloadStates();
             }
-            
+
             var assemblyChangesLoader = AssemblyChangesLoaderResolver.Instance.Resolve();
-            var changesAwaitingHotReload = _dynamicFileHotReloadStateEntries
+            var changesAwaitingHotReload = _changeBatcher.Entries
                 .Where(e => e.IsAwaitingCompilation)
                 .ToList();
 
@@ -632,8 +457,24 @@ namespace UnityReloader.Editor
                         sourceCodeFilesWithUniqueChangesAwaitingHotReload = changesAwaitingHotReload
                             .GroupBy(e => e.FullFileName)
                             .Select(e => e.First().FullFileName).ToList();
-                    
-                        var dynamicallyLoadedAssemblyCompilerResult = DynamicAssemblyCompiler.Compile(sourceCodeFilesWithUniqueChangesAwaitingHotReload, unityMainThreadDispatcher);
+
+                        var compilationResult = _compilationService.Compile(sourceCodeFilesWithUniqueChangesAwaitingHotReload, unityMainThreadDispatcher);
+                        LoggerScoped.Log(compilationResult.PlanLog);
+
+                        if (compilationResult.RequiresFullRecompile)
+                        {
+                            unityMainThreadDispatcher.Enqueue(() =>
+                            {
+#if UNITY_2019_3_OR_NEWER
+                                LoggerScoped.Log("Hot reload pre-analysis: structural changes detected - skipping hot compile, requesting full recompile.");
+                                CompilationPipeline.RequestScriptCompilation();
+#endif
+                            });
+                            changesAwaitingHotReload.ForEach(c => { c.IsBeingProcessed = false; });
+                            return;
+                        }
+
+                        var dynamicallyLoadedAssemblyCompilerResult = compilationResult.CompilerResult;
                         if (!dynamicallyLoadedAssemblyCompilerResult.IsError)
                         {
                             changesAwaitingHotReload.ForEach(c =>
@@ -642,13 +483,13 @@ namespace UnityReloader.Editor
                                 c.AssemblyNameCompiledIn = dynamicallyLoadedAssemblyCompilerResult.CompiledAssemblyPath;
                             });
 
-                            //TODO: return some proper results to make sure entries are correctly updated
-                            assemblyChangesLoader.DynamicallyUpdateMethodsForCreatedAssembly(dynamicallyLoadedAssemblyCompilerResult.CompiledAssembly, AssemblyChangesLoaderEditorOptionsNeededInBuild);
+                            var patchResult = _patchApplicator.Apply(dynamicallyLoadedAssemblyCompilerResult.CompiledAssembly, assemblyChangesLoader, AssemblyChangesLoaderEditorOptionsNeededInBuild);
 
-                            // A structural change (fields/serialization/attributes) cannot be applied by method detour -
-                            // fall back to a full Unity recompile so the change actually takes effect and the Inspector updates.
-                            if (assemblyChangesLoader.LastUpdateHadStructuralChange)
-                                _fullRecompileRequestedAfterFailure = true;
+                            if (patchResult.FallenBackToRecompile.Length > 0)
+                            {
+                                _fallbackRecompileService.Request();
+                                LoggerScoped.Log($"Hot reload: {patchResult.Applied.Length} change(s) applied; {patchResult.FallenBackToRecompile.Length} change(s) require full recompile [{string.Join(", ", patchResult.FallenBackToRecompile)}].");
+                            }
 
                             changesAwaitingHotReload.ForEach(c =>
                             {
@@ -657,7 +498,7 @@ namespace UnityReloader.Editor
                             }); //TODO: technically not all were hot swapped at same time
 
                             _hotReloadPerformedCount++;
-                            
+
                             SafeInvoke(HotReloadSucceeded, changesAwaitingHotReload);
                         }
                         else
@@ -688,7 +529,7 @@ namespace UnityReloader.Editor
                             LoggerScoped.LogError(e.Message + Environment.NewLine);
                         else
                             LoggerScoped.LogError($"Error when updating files: '{(sourceCodeFilesWithUniqueChangesAwaitingHotReload != null ? string.Join(",", sourceCodeFilesWithUniqueChangesAwaitingHotReload.Select(fn => new FileInfo(fn).Name)) : "unknown")}', {ex}");
-                        
+
                         changesAwaitingHotReload.ForEach(c =>
                         {
                             c.ErrorOn = DateTime.UtcNow;
@@ -696,7 +537,7 @@ namespace UnityReloader.Editor
                             c.SourceCodeCombinedFilePath = (ex as HotReloadCompilationException)?.SourceCodeCombinedFileCreated;
                         });
 
-                        _fullRecompileRequestedAfterFailure = true; // fallback to a full Unity recompile (handled on main thread in Update)
+                        _fallbackRecompileService.Request();
                         SafeInvoke(HotReloadFailed, changesAwaitingHotReload);
                     }
                 });
@@ -725,12 +566,12 @@ namespace UnityReloader.Editor
                 _lastProcessedDynamicFileHotReloadStatesInSession[assetGuid] = c;
             }
         }
-        
+
         private void ClearLastProcessedDynamicFileHotReloadStates()
         {
             _lastProcessedDynamicFileHotReloadStatesInSession.Clear();
         }
-        
+
         //Success entries will always be cleared - errors will remain till another change fixes them
         private void UpdateLastProcessedDynamicFileHotReloadStates(List<DynamicFileHotReloadState> changesToHotReload)
         {
@@ -759,98 +600,11 @@ namespace UnityReloader.Editor
                     _wasLockReloadAssembliesCalled = true;
                 }
             }
-            
+
             if(obj == PlayModeStateChange.EnteredEditMode && _wasLockReloadAssembliesCalled)
             {
                 EditorApplication.UnlockReloadAssemblies();
                 _wasLockReloadAssembliesCalled = false;
-            }
-        }
-        
-                private static bool TryWorkaroundForUnityFileWatcherBug(FileSystemEventArgs e, ref string filePathToUse)
-        {
-            LoggerScoped.LogWarning(@"Unity Reloader - Unity File Path Bug - Warning!
-Path for changed file passed by Unity does not exist. This is a known editor bug, more info: https://issuetracker.unity3d.com/issues/filesystemwatcher-returns-bad-file-path
-                    
-Best course of action is to update editor as issue is already fixed in newer (minor and major) versions.
-                    
-As a workaround asset will try to resolve paths via directory search.
-                    
-Workaround will search in all folders (under project root) and will use first found file. This means it's possible it'll pick up wrong file as there's no directory information available.");
-
-            var changedFileName = new FileInfo(filePathToUse).Name;
-            //TODO: try to look in all file watcher configured paths, some users might have code outside of assets, eg packages
-            // var fileFoundInAssets = UnityReloaderPreference.FileWatcherSetupEntries.GetElementsTyped().SelectMany(setupEntries => Directory.GetFiles(DataPath, setupEntries.path, SearchOption.AllDirectories)).ToList();
-
-            var fileFoundInAssets = Directory.GetFiles(DataPath, changedFileName, SearchOption.AllDirectories);
-            if (fileFoundInAssets.Length == 0)
-            {
-                LoggerScoped.LogError($"FileWatcherBugWorkaround: Unable to find file '{changedFileName}', changes will not be reloaded. Please update unity editor.");
-                return false;
-            }
-            else if (fileFoundInAssets.Length == 1)
-            {
-                LoggerScoped.Log($"FileWatcherBugWorkaround: Original Unity passed file path: '{e.FullPath}' adjusted to found: '{fileFoundInAssets[0]}'");
-                filePathToUse = fileFoundInAssets[0];
-                return true;
-            }
-            else
-            {
-                LoggerScoped.LogWarning($"FileWatcherBugWorkaround: Multiple files found. Original Unity passed file path: '{e.FullPath}' adjusted to found: '{fileFoundInAssets[0]}'");
-                filePathToUse = fileFoundInAssets[0];
-                return true;
-            }
-        }
-
-        private static bool HotReloadDisabled_WarningMessageShownAlready;
-        private static void EnsureInitialized()
-        {
-            if (!(bool)UnityReloaderPreference.EnableAutoReloadForChangedFiles.GetEditorPersistedValueOrDefault()
-                && !(bool)UnityReloaderPreference.EnableOnDemandReload.GetEditorPersistedValueOrDefault()
-                && !(bool)UnityReloaderPreference.WatchOnlySpecified.GetEditorPersistedValueOrDefault())
-            {
-                if (!HotReloadDisabled_WarningMessageShownAlready)
-                {
-                    LoggerScoped.LogWarning($"Neither auto hot reload / on-demand reload / or watch specific is specified, file watchers will not be initialized. Please adjust settings and restart if you want hot reload to work.");
-                    HotReloadDisabled_WarningMessageShownAlready = true;
-                }
-                return;
-            }
-            
-            var isUsingCustomFileWatchers = (FileWatcherImplementation)UnityReloaderPreference.FileWatcherImplementationInUse.GetEditorPersistedValueOrDefault() 
-                                            == FileWatcherImplementation.CustomPolling;
-            if (!isUsingCustomFileWatchers)
-            {
-                if (Instance._fileWatchers.Count == 0 || UnityReloaderPreference.FileWatcherSetupEntriesChanged)
-                {
-                    UnityReloaderPreference.FileWatcherSetupEntriesChanged = false;
-                    ClearFileWatchers();
-                    InitializeFromFileWatcherSetupEntries();
-                }
-            }
-            else if(!CustomFileWatcher.InitSignaled)
-            {
-                CustomFileWatcher.TryEnableLivewatching();
-                InitializeFromFileWatcherSetupEntries();
-                CustomFileWatcher.InitSignaled = true;
-            }
-        }
-
-        private static void InitializeFromFileWatcherSetupEntries()
-        {
-            var fileWatcherSetupEntries = UnityReloaderPreference.FileWatcherSetupEntries.GetElementsTyped();
-            if (fileWatcherSetupEntries.Count == 0)
-            {
-                LoggerScoped.LogWarning($"There are no file watcher setup entries. Tool will not be able to pick changes automatically");
-            }
-
-            foreach (var fileWatcherSetupEntry in fileWatcherSetupEntries)
-            {
-                Instance.StartWatchingDirectoryAndSubdirectories(
-                    fileWatcherSetupEntry.path,
-                    fileWatcherSetupEntry.filter,
-                    fileWatcherSetupEntry.includeSubdirectories
-                );
             }
         }
 
@@ -858,8 +612,8 @@ Workaround will search in all folders (under project root) and will use first fo
         {
             //TODO: could be a bit of a per hit, GetElementsTypes will parse json every time
             return UnityReloaderPreference.FileWatcherSetupEntries.GetElementsTyped()
-                .Any(e => e.path == fileWatcherSetupEntry.path 
-                          && e.filter == fileWatcherSetupEntry.filter 
+                .Any(e => e.path == fileWatcherSetupEntry.path
+                          && e.filter == fileWatcherSetupEntry.filter
                           && e.includeSubdirectories == fileWatcherSetupEntry.includeSubdirectories);
         }
 
@@ -868,7 +622,7 @@ Workaround will search in all folders (under project root) and will use first fo
             FileWatcherSetupEntry fileWatcherSetupEntry;
             return IsFileWatcherSetupEntryAlreadyPresent(selectedAsset, out fileWatcherSetupEntry);
         }
-        
+
         private static bool IsFileWatcherSetupEntryAlreadyPresent(DefaultAsset selectedAsset, out FileWatcherSetupEntry fileWatcherSetupEntry)
         {
             var path = FileWatcherReplacementTokenForApplicationDataPath + AssetDatabase.GetAssetPath(selectedAsset).Remove(0, "Assets".Length);
@@ -904,13 +658,13 @@ Workaround will search in all folders (under project root) and will use first fo
         public bool IsAwaitingCompilation => !IsFileCompiled && !ErrorOn.HasValue && !IsBeingProcessed;
         public bool IsFileCompiled => FileCompiledOn.HasValue;
         public DateTime? FileCompiledOn { get; set; }
-    
+
         public string AssemblyNameCompiledIn { get; set; }
 
         public bool IsAwaitingHotSwap => IsFileCompiled && !HotSwappedOn.HasValue;
         public DateTime? HotSwappedOn { get; set; }
         public bool IsChangeHotSwapped => HotSwappedOn.HasValue;
-    
+
         public string ErrorText { get; set; }
         public DateTime? ErrorOn { get; set; }
         public bool IsFailed => ErrorOn.HasValue;
